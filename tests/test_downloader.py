@@ -1,0 +1,55 @@
+import hashlib
+import unittest
+from model import Partial, Response, TransferError, manifest, Manifest
+from downloader import consume_response, ready_to_promote
+B=b"WXYZ5678"; E='"release-b"'; M=manifest(B,E)
+class DownloadTests(unittest.TestCase):
+    def setUp(self): self.p=Partial(E,B[:4])
+    def response(self, **kw):
+        v=dict(status=206,etag=E,content_range="bytes 4-7/8",body=B[4:]);v.update(kw);return Response(**v)
+    def reject(self, response, partial=None, target=M):
+        with self.assertRaises(TransferError): consume_response(self.p if partial is None else partial,response,target)
+    def test_valid_resume(self): self.assertEqual(consume_response(self.p,self.response(),M),Partial(E,B))
+    def test_multi_chunk(self):
+        p=Partial(E,b"")
+        for i in range(0,8,2): p=consume_response(p,Response(206,E,f"bytes {i}-{i+1}/8",B[i:i+2]),M)
+        self.assertTrue(ready_to_promote(p,M))
+    def test_full_response_replaces_partial(self): self.assertEqual(consume_response(self.p,Response(200,E,None,B),M),Partial(E,B))
+    def test_full_response_replaces_old_identity(self): self.assertEqual(consume_response(Partial('"a"',b"ABCD"),Response(200,E,None,B),M),Partial(E,B))
+    def test_changed_partial_rejected(self): self.reject(self.response(),Partial('"a"',b"ABCD"))
+    def test_changed_response_rejected(self): self.reject(self.response(etag='"a"'))
+    def test_weak_response_rejected(self): self.reject(self.response(etag='W/'+E))
+    def test_weak_target_rejected(self): self.reject(self.response(etag='W/'+E),Partial('W/'+E,B[:4]),Manifest('W/'+E,8,M.sha256))
+    def test_unquoted_target_rejected(self): self.reject(self.response(etag='b'),Partial('b',B[:4]),Manifest('b',8,M.sha256))
+    def test_missing_range(self): self.reject(self.response(content_range=None))
+    def test_wrong_start(self): self.reject(self.response(content_range='bytes 3-6/8'))
+    def test_gap(self): self.reject(self.response(content_range='bytes 5-7/8',body=B[5:]))
+    def test_wrong_total(self): self.reject(self.response(content_range='bytes 4-7/9'))
+    def test_short_body(self): self.reject(self.response(body=b'56'))
+    def test_long_body(self): self.reject(self.response(body=b'56789'))
+    def test_end_outside_total(self): self.reject(self.response(content_range='bytes 4-8/8',body=b'56789'))
+    def test_reversed_range(self): self.reject(self.response(content_range='bytes 4-3/8',body=b''))
+    def test_unknown_total(self): self.reject(self.response(content_range='bytes 4-7/*'))
+    def test_multipart_rejected(self): self.reject(self.response(content_range='bytes 0-1/8,4-7/8'))
+    def test_oversize_partial(self): self.reject(self.response(),Partial(E,B+b'X'))
+    def test_retry_same_chunk_not_appended(self): self.reject(self.response(),Partial(E,B))
+    def test_full_range_header_rejected(self): self.reject(Response(200,E,'bytes 0-7/8',B))
+    def test_full_short_rejected(self): self.reject(Response(200,E,None,B[:4]))
+    def test_full_long_rejected(self): self.reject(Response(200,E,None,B+b'X'))
+    def test_error_status(self): self.reject(Response(503,E,None,b''))
+    def test_complete_416(self): self.assertEqual(consume_response(Partial(E,B),Response(416,E,'bytes */8',b''),M),Partial(E,B))
+    def test_incomplete_416(self): self.reject(Response(416,E,'bytes */8',b''))
+    def test_wrong_digest_416(self): self.reject(Response(416,E,'bytes */8',b''),Partial(E,b'ABCD5678'))
+    def test_wrong_total_416(self): self.reject(Response(416,E,'bytes */9',b''),Partial(E,B))
+    def test_416_body_rejected(self): self.reject(Response(416,E,'bytes */8',b'x'),Partial(E,B))
+    def test_promote_valid(self): self.assertTrue(ready_to_promote(Partial(E,B),M))
+    def test_promote_mixed_equal_length(self): self.assertFalse(ready_to_promote(Partial(E,b'ABCD5678'),M))
+    def test_promote_incomplete(self): self.assertFalse(ready_to_promote(self.p,M))
+    def test_promote_wrong_identity(self): self.assertFalse(ready_to_promote(Partial('"a"',B),M))
+    def test_promote_weak_identity(self): self.assertFalse(ready_to_promote(Partial('W/'+E,B),Manifest('W/'+E,8,M.sha256)))
+    def test_empty_full_response(self):
+        m=manifest(b'',E); p=consume_response(Partial(E,b''),Response(200,E,None,b''),m);self.assertTrue(ready_to_promote(p,m))
+    def test_inputs_immutable_and_isolated(self):
+        first=consume_response(self.p,self.response(),M);second=consume_response(self.p,self.response(),M)
+        self.assertEqual(first,second);self.assertEqual(self.p,Partial(E,B[:4]))
+if __name__=='__main__': unittest.main()
